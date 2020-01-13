@@ -1,6 +1,6 @@
 image:
   azuredisk:
-    repository: mcr.microsoft.com/k8s/csi/azuredisk-csi
+    repository: zeromagic/azuredisk-csi
     tag: latest
     pullPolicy: Always
   csiProvisioner:

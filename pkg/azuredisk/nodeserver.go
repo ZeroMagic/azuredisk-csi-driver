@@ -17,14 +17,17 @@ limitations under the License.
 package azuredisk
 
 import (
+	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	volumehelper "sigs.k8s.io/azuredisk-csi-driver/pkg/util"
@@ -39,12 +42,15 @@ import (
 	"k8s.io/klog"
 	"k8s.io/kubernetes/pkg/util/resizefs"
 	"k8s.io/kubernetes/pkg/volume/util"
+	"k8s.io/legacy-cloud-providers/azure"
 )
 
 const (
 	defaultLinuxFsType      = "ext4"
 	defaultWindowsFsType    = "ntfs"
 	defaultAzureVolumeLimit = 16
+
+	stagingTargetPathFile = "/var/opt/azuredisk-stagingTargetPath.txt"
 )
 
 // store vm size list in current region
@@ -187,6 +193,11 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in request")
 	}
 
+	ephemeral := req.GetVolumeContext()["csi.storage.k8s.io/ephemeral"] == "true"
+	if ephemeral {
+		return d.nodePublishEphemeralVolume(ctx, req)
+	}
+
 	source := req.GetStagingTargetPath()
 	if len(source) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Staging target not provided")
@@ -272,12 +283,26 @@ func (d *Driver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublish
 	targetPath := req.GetTargetPath()
 	volumeID := req.GetVolumeId()
 
+	ephemeral := false
+	_, _, err := d.cloud.GetDisk(d.cloud.ResourceGroup, volumeID)
+	if err != nil {
+		if strings.Contains(err.Error(), "NotFound") {
+			ephemeral = true
+		} else {
+			return nil, err
+		}
+	}
+
 	klog.V(2).Infof("NodeUnpublishVolume: unmounting volume %s on %s", volumeID, targetPath)
-	err := d.mounter.Unmount(req.GetTargetPath())
+	err = d.mounter.Unmount(req.GetTargetPath())
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	klog.V(2).Infof("NodeUnpublishVolume: unmount volume %s on %s successfully", volumeID, targetPath)
+
+	if ephemeral {
+		return d.nodeUnpublishEphemeralVolume(ctx, req)
+	}
 
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
@@ -505,4 +530,239 @@ func (d *Driver) getBlockSizeBytes(devicePath string) (int64, error) {
 		return -1, fmt.Errorf("failed to parse size %s into int a size", strOut)
 	}
 	return gotSizeBytes, nil
+}
+
+func (d *Driver) nodePublishEphemeralVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
+	// check the id if it is valid
+	volumeId := req.GetVolumeId()
+	storageAccountType := req.GetVolumeContext()["storageAccountType"]
+	resourceGroup := req.GetVolumeContext()["resourceGroup"]
+
+	fsType := getDefaultFsType()
+	if mnt := req.GetVolumeCapability().GetMount(); mnt != nil {
+		if mnt.FsType != "" {
+			fsType = mnt.FsType
+		}
+	}
+
+	capacity, err := strconv.Atoi(req.GetVolumeContext()["capacity"])
+	if err != nil {
+		return nil, err
+	}
+	if capacity == 0 {
+		capacity = defaultDiskSize
+	}
+
+	skuName, err := normalizeStorageAccountType(storageAccountType)
+	if err != nil {
+		return nil, err
+	}
+
+	if resourceGroup == "" {
+		resourceGroup = d.cloud.ResourceGroup
+	}
+
+	volumeOptions := &azure.ManagedDiskOptions{
+		DiskName:           fmt.Sprintf("ephemeral-%s", volumeId),
+		StorageAccountType: skuName,
+		ResourceGroup:      resourceGroup,
+		SizeGB:             capacity,
+	}
+
+	// create volume
+	diskURI, err := d.cloud.CreateManagedDisk(volumeOptions)
+	if err != nil {
+		if strings.Contains(err.Error(), "NotFound") {
+			return nil, status.Error(codes.NotFound, err.Error())
+		}
+		return nil, err
+	}
+	defer func() {
+		if err != nil {
+			d.cloud.DeleteManagedDisk(diskURI)
+		}
+	}()
+
+	controllerPublishVolumeReq := &csi.ControllerPublishVolumeRequest{
+		VolumeId: diskURI,
+		NodeId:   d.NodeID,
+		Readonly: req.GetReadonly(),
+	}
+
+	// attach volume to node
+	controllerPublishResp, err := d.ControllerPublishVolume(ctx, controllerPublishVolumeReq)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err != nil {
+			controllerUnpublishVolumeReq := &csi.ControllerUnpublishVolumeRequest{
+				VolumeId: diskURI,
+				NodeId:   d.NodeID,
+			}
+			d.ControllerUnpublishVolume(ctx, controllerUnpublishVolumeReq)
+		}
+	}()
+
+	stagingTargetPath := "/var/run/azuredisk-csi/" + diskURI
+	// mount volume to VM
+	nodeStageReq := &csi.NodeStageVolumeRequest{
+		VolumeId:          diskURI,
+		PublishContext:    controllerPublishResp.PublishContext,
+		StagingTargetPath: stagingTargetPath,
+		VolumeCapability: &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Mount{
+				Mount: &csi.VolumeCapability_MountVolume{
+					FsType:     fsType,
+					MountFlags: []string{"rw"},
+				},
+			},
+			AccessMode: &csi.VolumeCapability_AccessMode{
+				Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+			},
+		},
+	}
+
+	_, err = d.NodeStageVolume(ctx, nodeStageReq)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err != nil {
+			nodeUnstageVolumeReq := &csi.NodeUnstageVolumeRequest{
+				VolumeId:          diskURI,
+				StagingTargetPath: stagingTargetPath,
+			}
+			d.NodeUnstageVolume(ctx, nodeUnstageVolumeReq)
+		}
+	}()
+
+	source := stagingTargetPath
+	target := req.TargetPath
+
+	if err := d.ensureMountPoint(target); err != nil {
+		return nil, status.Errorf(codes.Internal, "Could not mount target %q: %v", target, err)
+	}
+
+	if err := d.mounter.MakeDir(target); err != nil {
+		return nil, status.Errorf(codes.Internal, "Could not create dir %q: %v", target, err)
+	}
+
+	if err := d.mounter.Mount(source, target, "", nil); err != nil {
+		if removeErr := os.Remove(target); removeErr != nil {
+			return nil, status.Errorf(codes.Internal, "Could not remove mount target %q: %v", target, removeErr)
+		}
+		return nil, status.Errorf(codes.Internal, "Could not mount %q at %q: %v", source, target, err)
+	}
+
+	ephemeralVolumes, err := readStagingTargetPathFile()
+	if err != nil {
+		return nil, err
+	}
+	ephemeralVolumes[diskURI] = source
+	err = writeStagingTargetPathFile(ephemeralVolumes) 
+	if err != nil {
+		return nil, err
+	} 
+
+	return &csi.NodePublishVolumeResponse{}, nil
+}
+
+func (d *Driver) nodeUnpublishEphemeralVolume(ctx context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
+
+	volumeId := req.GetVolumeId()
+	diskName := fmt.Sprintf("ephemeral-%s", volumeId)
+
+	resourceGroup := d.cloud.ResourceGroup
+	_, diskURI, err := d.cloud.GetDisk(resourceGroup, diskName)
+	if err != nil {
+		return nil, err
+	}
+
+	ephemeralVolumes, err := readStagingTargetPathFile()
+	if err != nil {
+		return nil, err
+	}
+	stagingTargetPath, exist := ephemeralVolumes[diskURI]
+	if !exist {
+		return nil, err
+	}
+
+	delete(ephemeralVolumes, diskURI)
+	err = writeStagingTargetPathFile(ephemeralVolumes) 
+	if err != nil {
+		return nil, err
+	} 
+
+	nodeUnstageVolumeReq := &csi.NodeUnstageVolumeRequest{
+		VolumeId:          diskURI,
+		StagingTargetPath: stagingTargetPath,
+	}
+	_, err = d.NodeUnstageVolume(ctx, nodeUnstageVolumeReq)
+	if err != nil {
+		return nil, err
+	}
+
+	controllerUnpublishVolumeReq := &csi.ControllerUnpublishVolumeRequest{
+		VolumeId: diskURI,
+		NodeId:   d.NodeID,
+	}
+	_, err = d.ControllerUnpublishVolume(ctx, controllerUnpublishVolumeReq)
+	if err != nil {
+		return nil, err
+	}
+
+	err = d.cloud.DeleteManagedDisk(diskURI)
+	if err != nil {
+		return nil, err
+	}
+
+	return &csi.NodeUnpublishVolumeResponse{}, nil
+}
+
+var mutex sync.Mutex
+
+func writeStagingTargetPathFile(ephemeralVolumesStagingTargetPath map[string]string) error {
+	mutex.Lock()
+	defer mutex.Unlock()
+
+	f, err := os.OpenFile(stagingTargetPathFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	var content string
+	for diskURI, stagingTargetPath := range ephemeralVolumesStagingTargetPath {
+		content = strings.Join([]string{content, diskURI, ":", stagingTargetPath, "\n"}, "")
+	}
+	_, err = f.Write([]byte(content))
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func readStagingTargetPathFile() (map[string]string, error) {
+	mutex.Lock()
+	defer mutex.Unlock()
+
+	f, err := os.OpenFile(stagingTargetPathFile, os.O_RDONLY, 0622)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	ephemeralVolumesStagingTargetPath := make(map[string]string)
+	buf := bufio.NewReader(f)
+	for {
+		line, _, err := buf.ReadLine()
+		if err == io.EOF {
+			break
+		}
+		volumeInfos := strings.Split(string(line), ":")
+		ephemeralVolumesStagingTargetPath[volumeInfos[0]] = volumeInfos[1]
+	}
+	return ephemeralVolumesStagingTargetPath, nil
 }

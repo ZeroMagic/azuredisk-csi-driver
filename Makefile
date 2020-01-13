@@ -14,10 +14,10 @@
 
 PKG = sigs.k8s.io/azuredisk-csi-driver
 GIT_COMMIT ?= $(shell git rev-parse HEAD)
-REGISTRY ?= andyzhangx
+REGISTRY ?= zeromagic
 DRIVER_NAME = disk.csi.azure.com
 IMAGE_NAME = azuredisk-csi
-IMAGE_VERSION ?= v0.6.0
+IMAGE_VERSION ?= latest
 # Use a custom version for E2E tests if we are in Prow
 ifdef AZURE_CREDENTIALS
 override IMAGE_VERSION := e2e-$(GIT_COMMIT)
